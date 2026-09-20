@@ -12,6 +12,7 @@ let userId=null;
 let conversationId=null;
 let memory=[];
 let ready=false;
+let backendReady=false;
 let sending=false;
 
 function addMessage(role,text){
@@ -55,13 +56,7 @@ function rememberFrom(text){
   ];
   return patterns.flatMap(([re,key,type])=>{
     const m=text.match(re);
-    return m?[{
-      memory_key:key,
-      content:m[1].trim(),
-      memory_type:type,
-      importance:.8,
-      source:"conversation"
-    }]:[];
+    return m?[{memory_key:key,content:m[1].trim(),memory_type:type,importance:.8,source:"conversation"}]:[];
   });
 }
 
@@ -83,20 +78,33 @@ function generate(q){
   if(refs.length)
     return "Estoy usando contexto que tengo guardado:\n\n"+refs.map(x=>"• "+x.content).join("\n")+"\n\nSobre tu mensaje: "+q;
 
-  return "He recibido tu mensaje y puedo guardarlo como contexto. El modelo generativo de Fénix todavía no está conectado, así que no voy a fingir que soy una super-IA salida de un laboratorio clandestino.";
+  return "He recibido tu mensaje. El núcleo de Fénix está funcionando, pero el modelo generativo todavía no está conectado.";
+}
+
+function withTimeout(promise,ms,label){
+  return Promise.race([
+    promise,
+    new Promise((_,reject)=>setTimeout(()=>reject(new Error(label)),ms))
+  ]);
 }
 
 async function ensureAuth(){
-  const sessionResult=await supabase.auth.getSession();
+  const sessionResult=await withTimeout(
+    supabase.auth.getSession(),
+    8000,
+    "Supabase tardó demasiado en responder."
+  );
   if(sessionResult.error) throw sessionResult.error;
 
   let session=sessionResult.data.session;
 
   if(!session){
-    const authResult=await supabase.auth.signInAnonymously();
-    if(authResult.error){
-      throw new Error("No se pudo iniciar sesión anónima. Activa Authentication → Providers → Anonymous en Supabase.");
-    }
+    const authResult=await withTimeout(
+      supabase.auth.signInAnonymously(),
+      8000,
+      "El inicio de sesión anónimo tardó demasiado."
+    );
+    if(authResult.error) throw new Error("Anonymous Sign-In está desactivado en Supabase.");
     session=authResult.data.session;
   }
 
@@ -105,76 +113,84 @@ async function ensureAuth(){
 }
 
 async function loadMemory(){
-  const {data,error}=await supabase
-    .from("fenix_memory")
-    .select("id,memory_key,content,memory_type,importance,source,updated_at")
-    .order("updated_at",{ascending:false})
-    .limit(80);
-
+  const {data,error}=await withTimeout(
+    supabase.from("fenix_memory")
+      .select("id,memory_key,content,memory_type,importance,source,updated_at")
+      .order("updated_at",{ascending:false})
+      .limit(80),
+    8000,
+    "La memoria de Supabase no respondió."
+  );
   if(error) throw error;
   memory=data||[];
 }
 
 async function ensureConversation(){
-  const {data,error}=await supabase
-    .from("fenix_conversations")
-    .insert({user_id:userId,title:"Nueva conversación"})
-    .select("id")
-    .single();
-
+  const {data,error}=await withTimeout(
+    supabase.from("fenix_conversations")
+      .insert({user_id:userId,title:"Nueva conversación"})
+      .select("id")
+      .single(),
+    8000,
+    "No se pudo crear la conversación."
+  );
   if(error) throw error;
   conversationId=data.id;
 }
 
 async function saveMessage(role,content){
-  if(!conversationId||!userId) throw new Error("La conversación todavía no está lista.");
-
-  const {error}=await supabase
-    .from("fenix_messages")
-    .insert({conversation_id:conversationId,user_id:userId,role,content});
-
+  if(!backendReady||!conversationId||!userId) return;
+  const {error}=await withTimeout(
+    supabase.from("fenix_messages").insert({conversation_id:conversationId,user_id:userId,role,content}),
+    8000,
+    "No se pudo guardar el mensaje."
+  );
   if(error) throw error;
 }
 
 async function saveMemories(items){
+  if(!backendReady||!userId) return;
+
   for(const item of items){
-    const {data:existing,error:findError}=await supabase
-      .from("fenix_memory")
-      .select("id")
-      .eq("user_id",userId)
-      .eq("memory_key",item.memory_key)
-      .eq("content",item.content)
-      .limit(1);
+    const {data:existing,error:findError}=await withTimeout(
+      supabase.from("fenix_memory").select("id")
+        .eq("user_id",userId)
+        .eq("memory_key",item.memory_key)
+        .eq("content",item.content)
+        .limit(1),
+      8000,
+      "No se pudo consultar la memoria."
+    );
 
     if(findError) throw findError;
     if(existing?.length) continue;
 
-    const {error}=await supabase
-      .from("fenix_memory")
-      .insert({...item,user_id:userId});
-
+    const {error}=await withTimeout(
+      supabase.from("fenix_memory").insert({...item,user_id:userId}),
+      8000,
+      "No se pudo guardar la memoria."
+    );
     if(error) throw error;
   }
 
-  if(items.length) await loadMemory();
+  await loadMemory();
 }
 
 async function boot(){
-  send.disabled=true;
+  ready=true;
+  send.disabled=false;
+  setStatus("iniciando");
+
   try{
-    setStatus("conectando");
     await ensureAuth();
     await loadMemory();
     await ensureConversation();
-    ready=true;
-    send.disabled=false;
+    backendReady=true;
     setStatus("online","ready");
   }catch(error){
-    console.error("Fénix boot error:",error);
-    ready=false;
-    send.disabled=true;
-    setStatus("error","error");
-    addMessage("assistant",error.message||"Fénix no pudo iniciar correctamente.");
+    console.error("Fénix backend:",error);
+    backendReady=false;
+    setStatus("local","ready");
   }
 }
 
@@ -191,20 +207,25 @@ form.addEventListener("submit",async event=>{
   addMessage("user",q);
 
   try{
-    await saveMessage("user",q);
+    if(backendReady) await saveMessage("user",q);
 
     const newMemory=rememberFrom(q);
-    if(newMemory.length) await saveMemories(newMemory);
+    if(newMemory.length){
+      memory=[...newMemory,...memory];
+      if(backendReady) await saveMemories(newMemory);
+    }
 
     const answer=generate(q);
-    await saveMessage("assistant",answer);
+
+    if(backendReady) await saveMessage("assistant",answer);
     addMessage("assistant",answer);
   }catch(error){
     console.error("Fénix message error:",error);
-    addMessage("assistant","Hubo un error al guardar o procesar este mensaje. Revisa la conexión con Supabase.");
+    const answer=generate(q);
+    addMessage("assistant",answer+"\n\n[Modo local: Supabase no está disponible ahora mismo.]");
   }finally{
     sending=false;
-    send.disabled=!ready;
+    send.disabled=false;
     input.focus();
   }
 });
